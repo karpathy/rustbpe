@@ -282,7 +282,7 @@ impl Tokenizer {
     /// Called after training to enable O(1) token->bytes lookup in decode().
     fn build_vocab(&mut self) {
         // Start with base 256 single-byte tokens
-        self.vocab = (0..256u32).map(|i| vec![i as u8]).collect();
+        self.vocab = (0..=255u8).map(|i| vec![i]).collect();
 
         // Sort merges by token id to reconstruct bytes in order
         let mut sorted_merges: Vec<_> = self.merges.iter().collect();
@@ -308,7 +308,7 @@ impl Tokenizer {
     #[new]
     pub fn new() -> Self {
         // Initialize base vocabulary: 256 single-byte tokens
-        let vocab: Vec<Vec<u8>> = (0..256u32).map(|i| vec![i as u8]).collect();
+        let vocab: Vec<Vec<u8>> = (0..=255u8).map(|i| vec![i]).collect();
 
         Self {
             merges: StdHashMap::new(),
@@ -606,7 +606,7 @@ mod tests {
             merges,
             pattern: pattern.to_string(),
             compiled_pattern: Regex::new(pattern).unwrap(),
-            vocab: (0..256u32).map(|i| vec![i as u8]).collect(),
+            vocab: (0..=255u8).map(|i| vec![i]).collect(),
         };
         tok.build_vocab();
         tok
