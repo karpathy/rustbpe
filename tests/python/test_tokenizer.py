@@ -741,3 +741,77 @@ def test_batch_encode_performance(enwik8_large):
     # Warn if speedup is low (can vary by machine/load)
     if speedup < 1.5:
         warnings.warn(f"batch_encode() speedup was only {speedup:.2f}x (expected >1.5x)")
+
+
+def test_batch_decode_correctness(enwik8_small):
+    """Test that batch_decode() matches individual decode() calls."""
+    text = enwik8_small[:5000]
+    vocab_size = 512
+
+    tokenizer = rustbpe.Tokenizer()
+    tokenizer.train_from_iterator([text], vocab_size)
+
+    # Prepare test data: encode various texts
+    test_texts = [
+        "Hello world",
+        "The quick brown fox",
+        "jumps over the lazy dog",
+        "",  # empty string
+        "Testing 123!",
+        "MixedCASE with spaces",
+    ]
+
+    # Encode all texts
+    all_ids = [tokenizer.encode(t) for t in test_texts]
+
+    # Compare batch vs individual decoding
+    individual = [tokenizer.decode(ids) for ids in all_ids]
+    batched = tokenizer.batch_decode(all_ids)
+
+    assert individual == batched, "Batch decoding should match individual decoding"
+    print("✅ batch_decode() correctness verified")
+
+
+def test_batch_decode_roundtrip(enwik8_small):
+    """Test that batch_encode -> batch_decode produces original texts."""
+    text = enwik8_small[:3000]
+    vocab_size = 512
+
+    tokenizer = rustbpe.Tokenizer()
+    tokenizer.train_from_iterator([text], vocab_size)
+
+    test_texts = [
+        "Hello world!",
+        "Testing batch roundtrip",
+        "Multiple strings at once",
+    ]
+
+    # batch_encode then batch_decode
+    encoded = tokenizer.batch_encode(test_texts)
+    decoded = tokenizer.batch_decode(encoded)
+
+    assert decoded == test_texts, "batch_encode -> batch_decode should roundtrip"
+    print("✅ batch_decode() roundtrip works correctly")
+
+
+def test_batch_decode_empty():
+    """Test batch_decode with empty list."""
+    tokenizer = rustbpe.Tokenizer()
+
+    result = tokenizer.batch_decode([])
+    assert result == [], "Decoding empty list should return empty list"
+    print("✅ batch_decode([]) returns []")
+
+
+def test_batch_decode_invalid_token():
+    """Test that batch_decode raises error for invalid tokens."""
+    tokenizer = rustbpe.Tokenizer()
+
+    # Token 500 doesn't exist in base vocabulary (only 0-255)
+    try:
+        tokenizer.batch_decode([[104, 105], [500]])
+        assert False, "Should have raised an error for invalid token"
+    except ValueError as e:
+        assert "Unknown token id" in str(e) or "unknown" in str(e).lower()
+
+    print("✅ batch_decode() correctly rejects invalid tokens")

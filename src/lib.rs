@@ -549,6 +549,39 @@ impl Tokenizer {
 
         Ok(results)
     }
+
+    /// Decode multiple token ID sequences in parallel using rayon.
+    /// Returns a list of strings, one per input sequence.
+    #[pyo3(signature = (batch_ids))]
+    #[pyo3(text_signature = "(self, batch_ids)")]
+    pub fn batch_decode(
+        &self,
+        py: Python<'_>,
+        batch_ids: Vec<Vec<u32>>,
+    ) -> PyResult<Vec<String>> {
+        // Capture vocab reference for use in closure
+        let vocab = &self.vocab;
+
+        // Release Python GIL and decode in parallel using rayon
+        let results: Result<Vec<String>, String> = py.detach(|| {
+            batch_ids
+                .par_iter()
+                .map(|ids| {
+                    let mut bytes = Vec::new();
+                    for &id in ids {
+                        let token_bytes = vocab
+                            .get(id as usize)
+                            .ok_or_else(|| format!("Unknown token id: {}", id))?;
+                        bytes.extend(token_bytes);
+                    }
+                    String::from_utf8(bytes)
+                        .map_err(|e| format!("Decoded bytes are not valid UTF-8: {}", e))
+                })
+                .collect()
+        });
+
+        results.map_err(pyo3::exceptions::PyValueError::new_err)
+    }
 }
 
 #[pymodule]
