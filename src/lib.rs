@@ -23,6 +23,8 @@ pub struct Tokenizer {
     pub pattern: String,
     /// Compiled regex for efficiency
     compiled_pattern: Regex,
+    /// Cached vocabulary: token_id -> bytes (built after training)
+    vocab: Vec<Vec<u8>>,
 }
 
 impl Default for Tokenizer {
@@ -271,6 +273,31 @@ impl Tokenizer {
         }
 
         log::info!("Finished training: {} merges completed", merges_done);
+
+        // Build and cache vocabulary for efficient decode()
+        self.build_vocab();
+    }
+
+    /// Build vocabulary from merges and cache it.
+    /// Called after training to enable O(1) token->bytes lookup in decode().
+    fn build_vocab(&mut self) {
+        // Start with base 256 single-byte tokens
+        self.vocab = (0..=255u8).map(|i| vec![i]).collect();
+
+        // Sort merges by token id to reconstruct bytes in order
+        let mut sorted_merges: Vec<_> = self.merges.iter().collect();
+        sorted_merges.sort_by_key(|&(_, &token_id)| token_id);
+
+        // Build merged tokens incrementally
+        for (&(left, right), &merged_id) in &sorted_merges {
+            let mut merged_bytes = self.vocab[left as usize].clone();
+            merged_bytes.extend(&self.vocab[right as usize]);
+
+            if self.vocab.len() <= merged_id as usize {
+                self.vocab.resize(merged_id as usize + 1, Vec::new());
+            }
+            self.vocab[merged_id as usize] = merged_bytes;
+        }
     }
 }
 
@@ -280,10 +307,14 @@ impl Tokenizer {
     /// Create a new Tokenizer
     #[new]
     pub fn new() -> Self {
+        // Initialize base vocabulary: 256 single-byte tokens
+        let vocab: Vec<Vec<u8>> = (0..=255u8).map(|i| vec![i]).collect();
+
         Self {
             merges: StdHashMap::new(),
             pattern: String::new(),
             compiled_pattern: Regex::new("").expect("Empty regex should be valid"),
+            vocab,
         }
     }
 
@@ -427,33 +458,12 @@ impl Tokenizer {
 
     /// Return the mergeable ranks (token bytes -> token id / rank)
     pub fn get_mergeable_ranks(&self) -> Vec<(Vec<u8>, u32)> {
-        let mut mergeable_ranks = Vec::new();
-
-        // Build vocabulary incrementally from low to high token IDs
-        let mut token_bytes: Vec<Vec<u8>> = (0..256_u32).map(|i| vec![i as u8]).collect();
-
-        for (i, bytes) in token_bytes.iter().enumerate() {
-            mergeable_ranks.push((bytes.clone(), i as u32));
-        }
-
-        // Sort merges by token id (so we can reconstruct bytes progressively)
-        let mut sorted_merges: Vec<_> = self.merges.iter().collect();
-        sorted_merges.sort_by_key(|&(_, &token_id)| token_id);
-
-        for (&pair, &merged_id) in sorted_merges {
-            let (left, right) = pair;
-            let mut merged_bytes = token_bytes[left as usize].clone();
-            merged_bytes.extend(&token_bytes[right as usize]);
-
-            if token_bytes.len() <= merged_id as usize {
-                token_bytes.resize(merged_id as usize + 1, Vec::new());
-            }
-            token_bytes[merged_id as usize] = merged_bytes.clone();
-
-            mergeable_ranks.push((merged_bytes, merged_id));
-        }
-
-        mergeable_ranks
+        // Reuse cached vocab for O(1) lookup per token
+        self.vocab
+            .iter()
+            .enumerate()
+            .map(|(id, bytes)| (bytes.clone(), id as u32))
+            .collect()
     }
 
     /// Encode a string into token IDs
@@ -506,40 +516,10 @@ impl Tokenizer {
 
     /// Decode token IDs back to a string
     pub fn decode(&self, ids: Vec<u32>) -> PyResult<String> {
-        // Build reverse mapping: token_id -> bytes
-        let mut vocab: Vec<Vec<u8>> = (0..256u32).map(|i| vec![i as u8]).collect();
-
-        // Sort merges by token id to reconstruct bytes in order
-        let mut sorted_merges: Vec<_> = self.merges.iter().collect();
-        sorted_merges.sort_by_key(|&(_, &token_id)| token_id);
-
-        for (&(left, right), &merged_id) in &sorted_merges {
-            let mut merged_bytes = vocab
-                .get(left as usize)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid token id {} in merge",
-                        left
-                    ))
-                })?
-                .clone();
-            merged_bytes.extend(vocab.get(right as usize).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid token id {} in merge",
-                    right
-                ))
-            })?);
-
-            if vocab.len() <= merged_id as usize {
-                vocab.resize(merged_id as usize + 1, Vec::new());
-            }
-            vocab[merged_id as usize] = merged_bytes;
-        }
-
-        // Convert each token id to bytes and concatenate
+        // Use cached vocabulary for O(1) lookup per token
         let mut bytes = Vec::new();
         for &id in &ids {
-            let token_bytes = vocab.get(id as usize).ok_or_else(|| {
+            let token_bytes = self.vocab.get(id as usize).ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!("Unknown token id: {}", id))
             })?;
             bytes.extend(token_bytes);
@@ -569,6 +549,39 @@ impl Tokenizer {
 
         Ok(results)
     }
+
+    /// Decode multiple token ID sequences in parallel using rayon.
+    /// Returns a list of strings, one per input sequence.
+    #[pyo3(signature = (batch_ids))]
+    #[pyo3(text_signature = "(self, batch_ids)")]
+    pub fn batch_decode(
+        &self,
+        py: Python<'_>,
+        batch_ids: Vec<Vec<u32>>,
+    ) -> PyResult<Vec<String>> {
+        // Capture vocab reference for use in closure
+        let vocab = &self.vocab;
+
+        // Release Python GIL and decode in parallel using rayon
+        let results: Result<Vec<String>, String> = py.detach(|| {
+            batch_ids
+                .par_iter()
+                .map(|ids| {
+                    let mut bytes = Vec::new();
+                    for &id in ids {
+                        let token_bytes = vocab
+                            .get(id as usize)
+                            .ok_or_else(|| format!("Unknown token id: {}", id))?;
+                        bytes.extend(token_bytes);
+                    }
+                    String::from_utf8(bytes)
+                        .map_err(|e| format!("Decoded bytes are not valid UTF-8: {}", e))
+                })
+                .collect()
+        });
+
+        results.map_err(pyo3::exceptions::PyValueError::new_err)
+    }
 }
 
 #[pymodule]
@@ -585,6 +598,19 @@ fn rustbpe(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper to create a Tokenizer with given merges and pattern for testing.
+    /// Automatically builds the vocab cache.
+    fn make_tokenizer(merges: StdHashMap<Pair, u32>, pattern: &str) -> Tokenizer {
+        let mut tok = Tokenizer {
+            merges,
+            pattern: pattern.to_string(),
+            compiled_pattern: Regex::new(pattern).unwrap(),
+            vocab: (0..=255u8).map(|i| vec![i]).collect(),
+        };
+        tok.build_vocab();
+        tok
+    }
 
     #[test]
     fn test_word_pairs() {
@@ -650,11 +676,7 @@ mod tests {
     #[test]
     fn test_encode_with_pattern_no_merges() {
         // With a simple pattern but no merges, should return raw byte values
-        let tok = Tokenizer {
-            merges: StdHashMap::new(),
-            pattern: r"\w+".to_string(),
-            compiled_pattern: Regex::new(r"\w+").unwrap(),
-        };
+        let tok = make_tokenizer(StdHashMap::new(), r"\w+");
         let ids = tok.encode("hi");
         // 'h' = 104, 'i' = 105
         assert_eq!(ids, vec![104, 105]);
@@ -666,11 +688,7 @@ mod tests {
         let mut merges = StdHashMap::new();
         merges.insert((104, 105), 256); // 'hi' -> 256
 
-        let tok = Tokenizer {
-            merges,
-            pattern: r"\w+".to_string(),
-            compiled_pattern: Regex::new(r"\w+").unwrap(),
-        };
+        let tok = make_tokenizer(merges, r"\w+");
 
         let ids = tok.encode("hi");
         assert_eq!(ids, vec![256]); // merged into single token
@@ -698,11 +716,7 @@ mod tests {
         // Merge bytes 65 ('A') and 66 ('B') into token 256
         merges.insert((65, 66), 256);
 
-        let tok = Tokenizer {
-            merges,
-            pattern: String::new(),
-            compiled_pattern: Regex::new("").unwrap(),
-        };
+        let tok = make_tokenizer(merges, "");
 
         let ranks = tok.get_mergeable_ranks();
         assert_eq!(ranks.len(), 257); // 256 bytes + 1 merge
@@ -735,11 +749,7 @@ mod tests {
     #[test]
     fn test_train_core_incremental() {
         // Simple training test with repeated patterns
-        let mut tok = Tokenizer {
-            merges: StdHashMap::new(),
-            pattern: String::new(),
-            compiled_pattern: Regex::new("").unwrap(),
-        };
+        let mut tok = Tokenizer::new();
 
         // "ab" repeated 10 times, "cd" repeated 5 times
         let words = vec![
@@ -822,11 +832,7 @@ mod tests {
         merges.insert((97, 97), 256); // 'aa' -> 256 (learned first)
         merges.insert((256, 97), 257); // 'aa' + 'a' -> 257 (learned second)
 
-        let tok = Tokenizer {
-            merges,
-            pattern: r"\w+".to_string(),
-            compiled_pattern: Regex::new(r"\w+").unwrap(),
-        };
+        let tok = make_tokenizer(merges, r"\w+");
 
         // "aaa" should encode as [257]
         // Step 1: [97, 97, 97]
@@ -866,11 +872,7 @@ mod tests {
         let mut merges = StdHashMap::new();
         merges.insert((104, 105), 256); // 'hi' -> 256
 
-        let tok = Tokenizer {
-            merges,
-            pattern: r"\w+|\s+".to_string(),
-            compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
-        };
+        let tok = make_tokenizer(merges, r"\w+|\s+");
 
         let text = "hi";
         let ids = tok.encode(text);
@@ -885,11 +887,7 @@ mod tests {
         merges.insert((108, 108), 257); // 'll' -> 257
         merges.insert((256, 257), 258); // 'hell' -> 258
 
-        let tok = Tokenizer {
-            merges,
-            pattern: r"\w+|\s+".to_string(),
-            compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
-        };
+        let tok = make_tokenizer(merges, r"\w+|\s+");
 
         let text = "hello world";
         let ids = tok.encode(text);
@@ -900,11 +898,7 @@ mod tests {
     #[test]
     fn test_decode_byte_level() {
         // Decode raw byte tokens (no merges)
-        let tok = Tokenizer {
-            merges: StdHashMap::new(),
-            pattern: String::new(),
-            compiled_pattern: Regex::new("").unwrap(),
-        };
+        let tok = make_tokenizer(StdHashMap::new(), "");
 
         // [104, 105] = "hi"
         let decoded = tok.decode(vec![104, 105]).unwrap();
@@ -922,11 +916,7 @@ mod tests {
 
     #[test]
     fn test_train_multiple_merges() {
-        let mut tok = Tokenizer {
-            merges: StdHashMap::new(),
-            pattern: String::new(),
-            compiled_pattern: Regex::new("").unwrap(),
-        };
+        let mut tok = Tokenizer::new();
 
         // "ab" appears 100 times, "bc" appears 50 times
         // After merging "ab", the corpus becomes "X c" where X=256
@@ -947,11 +937,7 @@ mod tests {
 
     #[test]
     fn test_train_creates_chained_merges() {
-        let mut tok = Tokenizer {
-            merges: StdHashMap::new(),
-            pattern: String::new(),
-            compiled_pattern: Regex::new("").unwrap(),
-        };
+        let mut tok = Tokenizer::new();
 
         // "aaa" = [97, 97, 97]
         // First merge: (97, 97) -> 256, word becomes [256, 97]
@@ -973,11 +959,7 @@ mod tests {
         merges.insert((65, 66), 256); // 'AB' -> 256
         merges.insert((256, 67), 257); // 'ABC' -> 257
 
-        let tok = Tokenizer {
-            merges,
-            pattern: String::new(),
-            compiled_pattern: Regex::new("").unwrap(),
-        };
+        let tok = make_tokenizer(merges, "");
 
         let ranks = tok.get_mergeable_ranks();
         assert_eq!(ranks.len(), 258);
@@ -991,11 +973,7 @@ mod tests {
 
     #[test]
     fn test_encode_empty_string() {
-        let tok = Tokenizer {
-            merges: StdHashMap::new(),
-            pattern: r"\w+".to_string(),
-            compiled_pattern: Regex::new(r"\w+").unwrap(),
-        };
+        let tok = make_tokenizer(StdHashMap::new(), r"\w+");
 
         let ids = tok.encode("");
         assert!(ids.is_empty());
@@ -1004,11 +982,7 @@ mod tests {
     #[test]
     fn test_encode_no_matches() {
         // Pattern only matches words, input has no words
-        let tok = Tokenizer {
-            merges: StdHashMap::new(),
-            pattern: r"\w+".to_string(),
-            compiled_pattern: Regex::new(r"\w+").unwrap(),
-        };
+        let tok = make_tokenizer(StdHashMap::new(), r"\w+");
 
         let ids = tok.encode("   "); // only spaces
         assert!(ids.is_empty());
