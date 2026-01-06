@@ -28,6 +28,9 @@ compact_str = "0.9.0"
 # For Rust-side testing
 criterion = "0.5"  # benchmarking (optional)
 
+[build-dependencies]
+pyo3-build-config = { version = "0.27.2" }
+
 [features]
 default = []
 # extension-module is enabled by maturin during Python builds

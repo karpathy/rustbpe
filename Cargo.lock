@@ -590,6 +590,7 @@ dependencies = [
  "indexmap",
  "log",
  "pyo3",
+ "pyo3-build-config",
  "pyo3-log",
  "rayon",
 ]
