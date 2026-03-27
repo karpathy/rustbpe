@@ -15,7 +15,6 @@ crate-type = ["cdylib", "rlib"]
 # pyo3 provides the Python bindings
 # "extension-module" is enabled via feature flag (see below)
 pyo3 = { version = "0.27" }
-dary_heap = "0.3"
 indexmap = "2.2"
 fancy-regex = "0.16.1"
 log = "0.4.28"
@@ -27,6 +26,10 @@ compact_str = "0.9.0"
 [dev-dependencies]
 # For Rust-side testing
 criterion = "0.5"  # benchmarking (optional)
+
+[[bench]]
+name = "train"
+harness = false
 
 [features]
 default = []
