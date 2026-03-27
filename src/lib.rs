@@ -1,11 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::HashMap as StdHashMap;
+use std::collections::{BTreeSet, HashMap as StdHashMap};
 
-use dary_heap::OctonaryHeap;
 use fancy_regex::Regex;
 use pyo3::prelude::*;
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use compact_str::CompactString;
 use rayon::prelude::*;
 
@@ -13,6 +12,8 @@ use rayon::prelude::*;
 const GPT4_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
 
 type Pair = (u32, u32);
+type PairCounts = AHashMap<Pair, i32>;
+type PairOccurrences = AHashMap<Pair, AHashMap<usize, i32>>;
 
 /// A Byte Pair Encoding tokenizer that matches the GPT-4 style implementation
 #[pyclass]
@@ -99,74 +100,200 @@ impl Word {
     }
 }
 
-#[derive(Debug, Eq)]
-struct MergeJob {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PairPriority {
     pair: Pair,
-    count: u64,
-    /// set of word indices where this pair may occur and needs processing
-    pos: AHashSet<usize>,
+    count: i32,
 }
 
-impl PartialEq for MergeJob {
-    fn eq(&self, other: &Self) -> bool {
-        self.count == other.count && self.pair == other.pair
-    }
-}
-
-impl PartialOrd for MergeJob {
+impl PartialOrd for PairPriority {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for MergeJob {
+impl Ord for PairPriority {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Max-heap by count; tie-break to ascending pair order (deterministic)
+        // pop_last() should return the hottest pair; smaller pairs win ties.
         if self.count != other.count {
             self.count.cmp(&other.count)
         } else {
-            // ascending order on the pair when counts tie
             other.pair.cmp(&self.pair)
         }
     }
 }
 
 #[inline]
-fn count_pairs_parallel(
-    words: &[Word],
-    counts: &[i32],
-) -> (AHashMap<Pair, i32>, AHashMap<Pair, AHashSet<usize>>) {
+fn count_pairs_parallel(words: &[Word], counts: &[i32]) -> (PairCounts, PairOccurrences) {
     words
         .par_iter()
         .enumerate()
         .map(|(i, w)| {
-            let mut local_pc: AHashMap<Pair, i32> = AHashMap::new();
-            let mut local_wtu: AHashMap<Pair, AHashSet<usize>> = AHashMap::new();
+            let mut local_pc = PairCounts::new();
+            let mut local_occurrences = PairOccurrences::new();
             if w.ids.len() >= 2 && counts[i] != 0 {
+                let mut word_occurrences = AHashMap::new();
                 for (a, b) in w.pairs() {
-                    *local_pc.entry((a, b)).or_default() += counts[i];
-                    local_wtu.entry((a, b)).or_default().insert(i);
+                    *word_occurrences.entry((a, b)).or_default() += 1;
+                }
+                for (pair, occurrences) in word_occurrences {
+                    local_pc.insert(pair, occurrences * counts[i]);
+                    local_occurrences
+                        .entry(pair)
+                        .or_default()
+                        .insert(i, occurrences);
                 }
             }
-            (local_pc, local_wtu)
+            (local_pc, local_occurrences)
         })
         .reduce(
-            || (AHashMap::new(), AHashMap::new()),
-            |(mut acc_pc, mut acc_wtu), (pc, wtu)| {
+            || (PairCounts::new(), PairOccurrences::new()),
+            |(mut acc_pc, mut acc_occurrences), (pc, occurrences)| {
                 for (k, v) in pc {
                     *acc_pc.entry(k).or_default() += v;
                 }
-                for (k, s) in wtu {
-                    acc_wtu.entry(k).or_default().extend(s);
+                for (k, per_word) in occurrences {
+                    acc_occurrences.entry(k).or_default().extend(per_word);
                 }
-                (acc_pc, acc_wtu)
+                (acc_pc, acc_occurrences)
             },
         )
+}
+
+#[inline]
+fn apply_pair_count_delta(
+    active_pairs: &mut BTreeSet<PairPriority>,
+    pair_counts: &mut PairCounts,
+    pair: Pair,
+    delta: i32,
+) {
+    if delta == 0 {
+        return;
+    }
+
+    let old_count = pair_counts.get(&pair).copied().unwrap_or(0);
+    if old_count > 0 {
+        active_pairs.remove(&PairPriority {
+            pair,
+            count: old_count,
+        });
+    }
+
+    let new_count = old_count + delta;
+    debug_assert!(new_count >= 0, "pair count went negative for {:?}", pair);
+
+    if new_count > 0 {
+        pair_counts.insert(pair, new_count);
+        active_pairs.insert(PairPriority {
+            pair,
+            count: new_count,
+        });
+    } else {
+        pair_counts.remove(&pair);
+    }
+}
+
+#[inline]
+fn apply_pair_occurrence_delta(
+    pair_occurrences: &mut PairOccurrences,
+    pair: Pair,
+    word_idx: usize,
+    delta: i32,
+) {
+    if delta == 0 {
+        return;
+    }
+
+    let remove_pair = if let Some(per_word) = pair_occurrences.get_mut(&pair) {
+        let old_occurrences = per_word.get(&word_idx).copied().unwrap_or(0);
+        let new_occurrences = old_occurrences + delta;
+        debug_assert!(
+            new_occurrences >= 0,
+            "pair occurrences went negative for {:?} in word {}",
+            pair,
+            word_idx
+        );
+
+        if new_occurrences > 0 {
+            per_word.insert(word_idx, new_occurrences);
+        } else {
+            per_word.remove(&word_idx);
+        }
+
+        per_word.is_empty()
+    } else {
+        debug_assert!(
+            delta > 0,
+            "missing pair occurrence entry for negative delta on {:?}",
+            pair
+        );
+        let mut per_word = AHashMap::new();
+        per_word.insert(word_idx, delta);
+        pair_occurrences.insert(pair, per_word);
+        return;
+    };
+
+    if remove_pair {
+        pair_occurrences.remove(&pair);
+    }
 }
 
 // ------------------------ END helpers ------------------------
 
 impl Tokenizer {
+    fn set_pattern(&mut self, pattern: Option<&str>) -> Result<(), String> {
+        let pattern_str = pattern.unwrap_or(GPT4_PATTERN);
+        self.pattern = pattern_str.to_string();
+        self.compiled_pattern = Regex::new(pattern_str).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn train_from_chunk_counts(&mut self, counts: AHashMap<CompactString, i32>, vocab_size: u32) {
+        let mut words = Vec::with_capacity(counts.len());
+        let mut cvec = Vec::with_capacity(counts.len());
+        for (chunk, c) in counts {
+            words.push(Word::new(
+                chunk.as_bytes().iter().map(|&b| b as u32).collect(),
+            ));
+            cvec.push(c);
+        }
+
+        self.train_core_incremental(words, cvec, vocab_size);
+    }
+
+    pub fn train_from_texts<S>(
+        &mut self,
+        texts: &[S],
+        vocab_size: u32,
+        pattern: Option<&str>,
+    ) -> Result<(), String>
+    where
+        S: AsRef<str> + Sync,
+    {
+        self.set_pattern(pattern)?;
+
+        let pattern = self.compiled_pattern.clone();
+        let counts = texts
+            .par_iter()
+            .map(|text| {
+                let mut local = AHashMap::new();
+                for mat in pattern.find_iter(text.as_ref()) {
+                    let piece = mat.expect("regex match failed").as_str();
+                    *local.entry(CompactString::from(piece)).or_default() += 1;
+                }
+                local
+            })
+            .reduce(AHashMap::new, |mut acc, local| {
+                for (chunk, count) in local {
+                    *acc.entry(chunk).or_default() += count;
+                }
+                acc
+            });
+
+        self.train_from_chunk_counts(counts, vocab_size);
+        Ok(())
+    }
+
     /// Core incremental BPE training given unique words and their counts.
     /// `words`: one entry per unique chunk (Vec<u32> of token-ids/bytes).
     /// `counts`: same length as `words`, count per chunk.
@@ -176,24 +303,22 @@ impl Tokenizer {
         log::info!("Starting BPE training: {} merges to compute", num_merges);
         self.merges.clear();
 
-        // ---- Initial pair_counts and where_to_update (parallel) ----
+        // ---- Initial pair counts and exact per-word occurrences (parallel) ----
         log::info!(
             "Computing initial pair counts from {} unique sequences",
             words.len()
         );
-        let (mut pair_counts, mut where_to_update) = count_pairs_parallel(&words, &counts);
+        let (mut pair_counts, mut pair_occurrences) = count_pairs_parallel(&words, &counts);
 
-        // ---- Build heap ----
-        log::info!("Building heap with {} unique pairs", pair_counts.len());
-        let mut heap = OctonaryHeap::with_capacity(pair_counts.len());
-        for (pair, pos) in where_to_update.drain() {
-            let c = *pair_counts.get(&pair).unwrap_or(&0);
-            if c > 0 {
-                heap.push(MergeJob {
-                    pair,
-                    count: c as u64,
-                    pos,
-                });
+        // ---- Build live scheduler ----
+        log::info!(
+            "Building live scheduler with {} unique pairs",
+            pair_counts.len()
+        );
+        let mut active_pairs = BTreeSet::new();
+        for (&pair, &count) in &pair_counts {
+            if count > 0 {
+                active_pairs.insert(PairPriority { pair, count });
             }
         }
 
@@ -203,53 +328,39 @@ impl Tokenizer {
         let mut last_log_percent = 0u32;
 
         while merges_done < num_merges {
-            let Some(mut top) = heap.pop() else {
+            let Some(top) = active_pairs.pop_last() else {
                 break;
             };
 
-            // Lazy refresh: if the count changed since we queued this job, update and requeue
-            let current = *pair_counts.get(&top.pair).unwrap_or(&0);
-            if current <= 0 {
-                // Pair no longer exists or has non-positive count, skip it
-                continue;
-            }
-            if top.count != current as u64 {
-                top.count = current as u64;
-                heap.push(top);
-                continue;
-            }
+            // Merge this pair in all words where it occurs.
+            let affected_words: Vec<usize> = pair_occurrences
+                .get(&top.pair)
+                .expect("active pair missing occurrence tracking")
+                .keys()
+                .copied()
+                .collect();
 
             // Record merge
             let new_id = 256 + merges_done;
             self.merges.insert(top.pair, new_id);
 
-            // Merge this pair in all words where it occurs
-            let mut local_pos_updates: AHashMap<Pair, AHashSet<usize>> = AHashMap::new();
-            for &word_idx in &top.pos {
+            let mut pair_count_deltas = PairCounts::new();
+            let mut pair_occurrence_deltas = AHashMap::new();
+
+            for word_idx in affected_words {
                 // Apply merge to this word and collect pair-count deltas
                 let changes = words[word_idx].merge_pair(top.pair, new_id);
-                // Update global pair counts based on this word's count
                 for (pair, delta) in changes {
-                    let delta_total = delta * counts[word_idx];
-                    if delta_total != 0 {
-                        *pair_counts.entry(pair).or_default() += delta_total;
-                        if delta > 0 {
-                            local_pos_updates.entry(pair).or_default().insert(word_idx);
-                        }
-                    }
+                    *pair_count_deltas.entry(pair).or_default() += delta * counts[word_idx];
+                    *pair_occurrence_deltas.entry((pair, word_idx)).or_default() += delta;
                 }
             }
 
-            // Add the updated pair counts back to the heap
-            for (pair, pos) in local_pos_updates {
-                let cnt = *pair_counts.get(&pair).unwrap_or(&0);
-                if cnt > 0 {
-                    heap.push(MergeJob {
-                        pair,
-                        count: cnt as u64,
-                        pos,
-                    });
-                }
+            for ((pair, word_idx), delta) in pair_occurrence_deltas {
+                apply_pair_occurrence_delta(&mut pair_occurrences, pair, word_idx, delta);
+            }
+            for (pair, delta) in pair_count_deltas {
+                apply_pair_count_delta(&mut active_pairs, &mut pair_counts, pair, delta);
             }
 
             merges_done += 1;
@@ -264,7 +375,7 @@ impl Tokenizer {
                     num_merges,
                     top.pair,
                     new_id,
-                    top.count
+                    top.count as u64
                 );
                 last_log_percent = current_percent;
             }
@@ -300,14 +411,8 @@ impl Tokenizer {
         buffer_size: usize,
         pattern: Option<String>,
     ) -> PyResult<()> {
-        // Use provided pattern or default to GPT-4 pattern
-        let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
-
-        // Update the stored pattern and compile it
-        self.pattern = pattern_str.clone();
-        self.compiled_pattern = Regex::new(&pattern_str).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Invalid regex pattern: {}", e))
-        })?;
+        self.set_pattern(pattern.as_deref())
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
         // Prepare a true Python iterator object
         let py_iter: pyo3::Py<pyo3::PyAny> = unsafe {
@@ -400,17 +505,7 @@ impl Tokenizer {
             counts.len()
         );
 
-        // Materialize words & counts
-        let mut words = Vec::with_capacity(counts.len());
-        let mut cvec = Vec::with_capacity(counts.len());
-        for (chunk, c) in counts.into_iter() {
-            words.push(Word::new(
-                chunk.as_bytes().iter().map(|&b| b as u32).collect(),
-            ));
-            cvec.push(c);
-        }
-
-        self.train_core_incremental(words, cvec, vocab_size);
+        self.train_from_chunk_counts(counts, vocab_size);
         Ok(())
     }
 
@@ -728,8 +823,8 @@ mod tests {
         assert_eq!(pair_counts.get(&(2, 4)), Some(&2));
 
         // Check positions
-        assert!(positions.get(&(1, 2)).unwrap().contains(&0));
-        assert!(positions.get(&(1, 2)).unwrap().contains(&1));
+        assert_eq!(positions.get(&(1, 2)).unwrap().get(&0), Some(&1));
+        assert_eq!(positions.get(&(1, 2)).unwrap().get(&1), Some(&1));
     }
 
     #[test]
@@ -755,6 +850,30 @@ mod tests {
         assert_eq!(tok.merges.len(), 1);
         assert!(tok.merges.contains_key(&(97, 98)));
         assert_eq!(tok.merges.get(&(97, 98)), Some(&256));
+    }
+
+    #[test]
+    fn test_count_pairs_parallel_tracks_multiple_occurrences_per_word() {
+        let words = vec![Word::new(vec![1, 2, 1, 2, 3])];
+        let counts = vec![1];
+
+        let (pair_counts, positions) = count_pairs_parallel(&words, &counts);
+
+        assert_eq!(pair_counts.get(&(1, 2)), Some(&2));
+        assert_eq!(positions.get(&(1, 2)).unwrap().get(&0), Some(&2));
+    }
+
+    #[test]
+    fn test_train_from_texts() {
+        let mut tok = Tokenizer::new();
+        let texts = vec!["abab abab".to_string(), "abab".to_string()];
+
+        tok.train_from_texts(&texts, 257, Some(r"\w+"))
+            .expect("Rust-side training should succeed");
+
+        assert_eq!(tok.vocab_size(), 257);
+        assert_eq!(tok.get_pattern(), r"\w+");
+        assert_eq!(tok.encode("abab"), vec![256, 256]);
     }
 
     // ==================== Additional comprehensive tests ====================
