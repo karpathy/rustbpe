@@ -844,18 +844,7 @@ mod tests {
         // [97, 97, 97, 97, 97]
         // -> [256, 97, 97, 97] (merge first aa)
         // -> [256, 256, 97] (merge second aa)
-        // -> [257, 256] (merge (256, 97))
-        // Wait, let me recalculate...
-        // Actually the algorithm picks the pair with LOWEST new_id.
-        // (97, 97) -> 256, (256, 97) -> 257
-        // So 256 < 257, meaning (97, 97) is always preferred.
-        // [97, 97, 97, 97, 97]
-        // Pairs: (97,97) at 0,1,2,3. All map to 256.
-        // Pick leftmost (position 0): [256, 97, 97, 97]
-        // Pairs: (256,97)->257, (97,97)->256 at pos 1,2
-        // 256 < 257, pick (97,97) at pos 1: [256, 256, 97]
-        // Pairs: (256,256) not in merges, (256,97)->257
-        // Only option is 257: [256, 257]
+        // -> [256, 257] (merge (256, 97))
         let ids = tok.encode("aaaaa");
         assert_eq!(ids, vec![256, 257]);
     }
@@ -927,12 +916,6 @@ mod tests {
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
         };
-
-        // "ab" appears 100 times, "bc" appears 50 times
-        // After merging "ab", the corpus becomes "X c" where X=256
-        // Then "Xc" (256, 99) should be merged next? No wait...
-        // Let's use a simpler example:
-        // "ab" appears 10 times
         let words = vec![
             Word::new(vec![97, 98]), // "ab"
         ];
