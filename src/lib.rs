@@ -134,13 +134,13 @@ impl Ord for MergeJob {
 #[inline]
 fn count_pairs_parallel(
     words: &[Word],
-    counts: &[i32],
-) -> (AHashMap<Pair, i32>, AHashMap<Pair, AHashSet<usize>>) {
+    counts: &[i64],
+) -> (AHashMap<Pair, i64>, AHashMap<Pair, AHashSet<usize>>) {
     words
         .par_iter()
         .enumerate()
         .map(|(i, w)| {
-            let mut local_pc: AHashMap<Pair, i32> = AHashMap::new();
+            let mut local_pc: AHashMap<Pair, i64> = AHashMap::new();
             let mut local_wtu: AHashMap<Pair, AHashSet<usize>> = AHashMap::new();
             if w.ids.len() >= 2 && counts[i] != 0 {
                 for (a, b) in w.pairs() {
@@ -170,7 +170,7 @@ impl Tokenizer {
     /// Core incremental BPE training given unique words and their counts.
     /// `words`: one entry per unique chunk (Vec<u32> of token-ids/bytes).
     /// `counts`: same length as `words`, count per chunk.
-    fn train_core_incremental(&mut self, mut words: Vec<Word>, counts: Vec<i32>, vocab_size: u32) {
+    fn train_core_incremental(&mut self, mut words: Vec<Word>, counts: Vec<i64>, vocab_size: u32) {
         assert!(vocab_size >= 256, "vocab_size must be at least 256");
         let num_merges = vocab_size - 256;
         log::info!("Starting BPE training: {} merges to compute", num_merges);
@@ -230,7 +230,7 @@ impl Tokenizer {
                 let changes = words[word_idx].merge_pair(top.pair, new_id);
                 // Update global pair counts based on this word's count
                 for (pair, delta) in changes {
-                    let delta_total = delta * counts[word_idx];
+                    let delta_total = (delta as i64) * counts[word_idx];
                     if delta_total != 0 {
                         *pair_counts.entry(pair).or_default() += delta_total;
                         if delta > 0 {
@@ -290,8 +290,15 @@ impl Tokenizer {
     /// Train from a streaming iterator (parallel ingestion).
     /// We refill a Rust Vec<String> buffer under the GIL, then release the GIL
     /// to do the heavy splitting and counting **in parallel** with rayon.
-    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None))]
-    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None)")]
+    ///
+    /// `min_freq`: chunks (regex-split pieces) appearing fewer than `min_freq`
+    /// times are dropped before training. This dramatically reduces memory on
+    /// large corpora (especially CJK, where most long runs are singletons).
+    /// Defaults to 1 (no pruning).
+    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, min_freq=1))]
+    #[pyo3(
+        text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, min_freq=1)"
+    )]
     pub fn train_from_iterator(
         &mut self,
         py: pyo3::Python<'_>,
@@ -299,6 +306,7 @@ impl Tokenizer {
         vocab_size: u32,
         buffer_size: usize,
         pattern: Option<String>,
+        min_freq: i32,
     ) -> PyResult<()> {
         // Use provided pattern or default to GPT-4 pattern
         let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
@@ -400,15 +408,27 @@ impl Tokenizer {
             counts.len()
         );
 
-        // Materialize words & counts
-        let mut words = Vec::with_capacity(counts.len());
-        let mut cvec = Vec::with_capacity(counts.len());
+        // Materialize words & counts, pruning rare chunks to bound memory.
+        let min_freq = min_freq.max(1);
+        let total_unique = counts.len();
+        let mut words = Vec::with_capacity(total_unique);
+        let mut cvec: Vec<i64> = Vec::with_capacity(total_unique);
         for (chunk, c) in counts.into_iter() {
+            if c < min_freq {
+                continue;
+            }
             words.push(Word::new(
                 chunk.as_bytes().iter().map(|&b| b as u32).collect(),
             ));
-            cvec.push(c);
+            cvec.push(c as i64);
         }
+        log::info!(
+            "Kept {} sequences after pruning (min_freq={}), dropped {} of {} unique",
+            words.len(),
+            min_freq,
+            total_unique - words.len(),
+            total_unique
+        );
 
         self.train_core_incremental(words, cvec, vocab_size);
         Ok(())
@@ -716,7 +736,7 @@ mod tests {
     #[test]
     fn test_count_pairs_parallel() {
         let words = vec![Word::new(vec![1, 2, 3]), Word::new(vec![1, 2, 4])];
-        let counts = vec![1, 2]; // first word appears 1x, second 2x
+        let counts: Vec<i64> = vec![1, 2]; // first word appears 1x, second 2x
 
         let (pair_counts, positions) = count_pairs_parallel(&words, &counts);
 
@@ -746,7 +766,7 @@ mod tests {
             Word::new(vec![97, 98]),  // "ab"
             Word::new(vec![99, 100]), // "cd"
         ];
-        let counts = vec![10, 5];
+        let counts: Vec<i64> = vec![10, 5];
 
         // Train with vocab_size = 257 (one merge)
         tok.train_core_incremental(words, counts, 257);
@@ -936,7 +956,7 @@ mod tests {
         let words = vec![
             Word::new(vec![97, 98]), // "ab"
         ];
-        let counts = vec![10];
+        let counts: Vec<i64> = vec![10];
 
         // Train with vocab_size = 258 (2 merges)
         // But we only have one unique pair, so only one merge will happen
@@ -957,7 +977,7 @@ mod tests {
         // First merge: (97, 97) -> 256, word becomes [256, 97]
         // Second merge: (256, 97) -> 257, word becomes [257]
         let words = vec![Word::new(vec![97, 97, 97])];
-        let counts = vec![10];
+        let counts: Vec<i64> = vec![10];
 
         tok.train_core_incremental(words, counts, 258);
 
@@ -1051,7 +1071,7 @@ mod tests {
     #[test]
     fn test_count_pairs_parallel_empty() {
         let words: Vec<Word> = vec![];
-        let counts: Vec<i32> = vec![];
+        let counts: Vec<i64> = vec![];
 
         let (pair_counts, positions) = count_pairs_parallel(&words, &counts);
         assert!(pair_counts.is_empty());
@@ -1062,7 +1082,7 @@ mod tests {
     fn test_count_pairs_parallel_zero_count() {
         // Words with zero count should not contribute
         let words = vec![Word::new(vec![1, 2, 3])];
-        let counts = vec![0];
+        let counts: Vec<i64> = vec![0];
 
         let (pair_counts, _positions) = count_pairs_parallel(&words, &counts);
         assert!(pair_counts.is_empty());

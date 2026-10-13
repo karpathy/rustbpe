@@ -641,6 +641,24 @@ def test_vocab_size():
     print("✅ vocab_size property works correctly")
 
 
+def test_min_freq():
+    """Test that min_freq drops rare chunks before training."""
+    texts = ["ab ab ab cd"]
+
+    # Default (min_freq=1): the singleton chunk "cd" still gets merged
+    tokenizer = rustbpe.Tokenizer()
+    tokenizer.train_from_iterator(texts, vocab_size=258, pattern=r"\w+")
+    assert len(tokenizer.encode("cd")) == 1, "Expected 'cd' to be merged with min_freq=1"
+
+    # min_freq=2: "cd" appears once, so it is pruned and never merged
+    tokenizer = rustbpe.Tokenizer()
+    tokenizer.train_from_iterator(texts, vocab_size=258, pattern=r"\w+", min_freq=2)
+    assert len(tokenizer.encode("ab")) == 1, "Expected 'ab' to be merged with min_freq=2"
+    assert tokenizer.encode("cd") == [99, 100], "Expected 'cd' to stay as raw bytes with min_freq=2"
+
+    print("✅ min_freq pruning works correctly")
+
+
 def test_decode_roundtrip(enwik8_small):
     """Test that encode->decode produces the original text."""
     text = enwik8_small[:1000]  # Use first 1KB for quick test
